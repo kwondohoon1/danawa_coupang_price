@@ -1,0 +1,44 @@
+name: Danawa Auto Crawl
+
+on:
+  schedule:
+    - cron: '0 18 * * *'  # 매일 03:00 KST (UTC+9 → 18시 UTC)
+  workflow_dispatch:      # 수동 실행 버튼도 허용
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get -y install unzip
+        pip install aiohttp selenium beautifulsoup4 openpyxl pandas webdriver-manager
+
+    - name: Install Chrome
+      run: |
+        wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+        sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get -fy install
+        wget -q https://storage.googleapis.com/chrome-for-testing-public/141.0.7390.107/linux64/chromedriver-linux64.zip
+        unzip -o chromedriver-linux64.zip
+        sudo mv chromedriver-linux64/chromedriver /usr/bin/chromedriver
+        sudo chmod +x /usr/bin/chromedriver
+        google-chrome --version
+        chromedriver --version
+
+    - name: Run crawler
+      run: python auto_danawa_crawler.py
+
+    - name: Upload result Excel
+      uses: actions/upload-artifact@v4
+      with:
+        name: danawa-result
+        path: danawa_쿠팡_결과_*.xlsx
