@@ -22,21 +22,18 @@ from selenium.webdriver.support import expected_conditions as EC
 from datetime import datetime
 
 # ===============================================
-# ⚡ Danawa 쿠팡 크롤러 (Selenium 100%)
+# ⚡ Danawa 쿠팡
 # ===============================================
 
-headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 TARGET_COLS = ["쿠팡", "쿠팡와우", "쿠팡카드혜택가"]
 
-BASE = Path(__file__).parent
-INPUT_PATH = BASE / "상품코드목록.xlsx"
-OUTPUT_PATH = BASE / f"danawa_쿠팡_정확버전_{datetime.now():%Y%m%d_%H%M}.xlsx"
+# GitHub Actions / 로컬 모두 호환되도록 작업 경로 자동 설정
+WORKDIR = Path(os.getenv("GITHUB_WORKSPACE", os.getcwd()))
+INPUT_PATH = WORKDIR / "상품코드목록.xlsx"
+OUTPUT_PATH = WORKDIR / f"danawa_쿠팡_정확버전_{datetime.now():%Y%m%d_%H%M}.xlsx"
 
 def _only_digits(s): return re.sub(r"[^\d]", "", s or "")
 
-# -----------------------------
-# 🔹 Chrome 드라이버 생성
-# -----------------------------
 def get_driver():
     from webdriver_manager.chrome import ChromeDriverManager
     options = Options()
@@ -47,35 +44,20 @@ def get_driver():
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-blink-features=AutomationControlled")
     service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-    return driver
+    return webdriver.Chrome(service=service, options=options)
 
-# -----------------------------
-# 🔹 페이지 파싱 함수
-# -----------------------------
 def parse_with_selenium(driver, pcode):
-    """단일 상품코드에 대해 Selenium으로 완전 로딩 후 HTML 파싱"""
     url = f"https://prod.danawa.com/info/?pcode={pcode}"
     row = {"상품코드": pcode, "상품명": "이름없음", "쿠팡": "X", "쿠팡와우": "X", "쿠팡카드혜택가": "X"}
     try:
         driver.get(url)
-        # 페이지 완전 로드 대기
         WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.readyState") == "complete")
-
-        # 가격 섹션 보일 때까지 기다림
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "#lowPriceCompanyArea"))
-        )
-
-        # 천천히 스크롤해서 동적 로딩 유도
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#lowPriceCompanyArea")))
         for _ in range(6):
             driver.execute_script("window.scrollBy(0, 500);")
             time.sleep(0.8)
 
-        html = driver.page_source
-        soup = BeautifulSoup(html, "html.parser")
-
-        # 상품명
+        soup = BeautifulSoup(driver.page_source, "html.parser")
         title_tag = soup.select_one("meta[property='og:title']")
         if title_tag and title_tag.get("content"):
             row["상품명"] = title_tag["content"].strip()
@@ -84,43 +66,34 @@ def parse_with_selenium(driver, pcode):
             if alt:
                 row["상품명"] = alt.get_text(strip=True)
 
-        # 가격 섹션
         for li in soup.select("ul.list__mall-price > li.list-item"):
-            text_all = li.get_text(" ", strip=True)
+            txt = li.get_text(" ", strip=True)
             prices = [int(_only_digits(p.get_text(strip=True))) for p in li.select(".text__num, .price_num strong, .txt_prc strong, .prc strong") if _only_digits(p.get_text(strip=True))]
             if not prices:
                 continue
             price = min(prices)
-
-            # 쿠팡 로고 확인
-            is_coupang = False
             logo = li.select_one(".box__logo, .box__logo-wrap .box__logo")
-            if logo:
-                if "쿠팡" in logo.get("aria-label", ""):
-                    is_coupang = True
-                img = logo.select_one("img[alt]")
-                if img and "쿠팡" in (img.get("alt") or ""):
-                    is_coupang = True
+            if not logo:
+                continue
+            is_coupang = "쿠팡" in (logo.get("aria-label") or "")
+            img = logo.select_one("img[alt]")
+            if img and "쿠팡" in img.get("alt", ""):
+                is_coupang = True
             if not is_coupang:
                 continue
 
-            # 분류
-            if "와우" in text_all or "WOW" in text_all.upper():
+            if "와우" in txt or "WOW" in txt.upper():
                 row["쿠팡와우"] = str(price)
-            elif any(k in text_all for k in ["카드", "청구", "할인", "삼성", "롯데", "하나", "현대"]):
+            elif any(k in txt for k in ["카드", "청구", "할인", "삼성", "롯데", "하나", "현대"]):
                 row["쿠팡카드혜택가"] = str(price)
             else:
                 row["쿠팡"] = str(price)
-
         return row
 
     except Exception as e:
-        print(f"[오류] {pcode} → {e}")
+        print(f"[오류] {pcode}: {e}")
         return row
 
-# -----------------------------
-# 🔹 전체 실행
-# -----------------------------
 def run_requests_crawler():
     try:
         print(f"[{datetime.now()}] Danawa 정확버전 시작")
@@ -130,12 +103,11 @@ def run_requests_crawler():
 
         results = []
         for idx, code in enumerate(codes, start=1):
-            print(f"({idx}/{len(codes)}) 수집 중... {code}")
+            print(f"({idx}/{len(codes)}) {code} 크롤링 중...")
             row = parse_with_selenium(driver, code)
             results.append(row)
 
         driver.quit()
-
         df_out = pd.DataFrame(results).fillna("X")
         nums = pd.DataFrame({
             "쿠팡": pd.to_numeric(df_out["쿠팡"], errors="coerce"),
@@ -143,7 +115,6 @@ def run_requests_crawler():
             "쿠팡카드혜택가": pd.to_numeric(df_out["쿠팡카드혜택가"], errors="coerce"),
         })
         df_out["최저가"] = nums.min(axis=1).map(lambda x: "X" if pd.isna(x) else str(int(x)))
-
         df_out.to_excel(OUTPUT_PATH, index=False)
 
         wb = load_workbook(OUTPUT_PATH)
@@ -156,10 +127,11 @@ def run_requests_crawler():
                     for cell in r:
                         cell.fill = yellow
         wb.save(OUTPUT_PATH)
-        print(f"✅ 완료: {OUTPUT_PATH}")
+
+        print(f"✅ 결과 파일 생성: {OUTPUT_PATH}")
     except Exception as e:
         print(traceback.format_exc())
-        print(f"❌ 오류: {e}")
+        print(f"❌ 오류 발생: {e}")
 
 if __name__ == "__main__":
     run_requests_crawler()
