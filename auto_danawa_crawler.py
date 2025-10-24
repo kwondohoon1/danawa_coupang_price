@@ -7,7 +7,7 @@ Original file is located at
     https://colab.research.google.com/drive/1-Mq30bavMMGFxHgWOOCEJpdgMXmn4L3i
 """
 
-import os, re, io, time, tempfile, traceback
+import os, re, io, tempfile, traceback, asyncio, aiohttp, time
 from pathlib import Path
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -21,16 +21,12 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from datetime import datetime
 
-# ===============================================
-# ⚡ Danawa 쿠팡
-# ===============================================
-
+headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 TARGET_COLS = ["쿠팡", "쿠팡와우", "쿠팡카드혜택가"]
 
-# GitHub Actions / 로컬 모두 호환되도록 작업 경로 자동 설정
 WORKDIR = Path(os.getenv("GITHUB_WORKSPACE", os.getcwd()))
 INPUT_PATH = WORKDIR / "상품코드목록.xlsx"
-OUTPUT_PATH = WORKDIR / f"danawa_쿠팡_정확버전_{datetime.now():%Y%m%d_%H%M}.xlsx"
+OUTPUT_PATH = WORKDIR / f"danawa_쿠팡_결과_{datetime.now():%Y%m%d_%H%M}.xlsx"
 
 def _only_digits(s): return re.sub(r"[^\d]", "", s or "")
 
@@ -46,68 +42,140 @@ def get_driver():
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=options)
 
-def parse_with_selenium(driver, pcode):
-    url = f"https://prod.danawa.com/info/?pcode={pcode}"
+def fetch_wow_prices_selenium(driver, pcodes):
+    """단일 Selenium 인스턴스로 와우가격 보정"""
+    wow_map = {}
+    for pcode in pcodes:
+        try:
+            url = f"https://prod.danawa.com/info/?pcode={pcode}"
+            driver.get(url)
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#lowPriceCompanyArea"))
+            )
+
+            # 페이지 완전 로딩 및 스크롤
+            for _ in range(6):
+                driver.execute_script("window.scrollBy(0, 500);")
+                time.sleep(0.8)
+
+            html = driver.page_source
+            soup = BeautifulSoup(html, "html.parser")
+            full_text = soup.get_text(" ", strip=True)
+            wow_match = re.search(r"와우.?할인.?가\s*([\d,]+)\s*원", full_text)
+            if wow_match:
+                wow_map[pcode] = wow_match.group(1).replace(",", "")
+        except Exception:
+            continue
+    return wow_map
+
+# -----------------------------
+# 🔹 HTML 파싱
+# -----------------------------
+def _is_coupang_logo(el):
+    if el is None:
+        return False
+    img = el.select_one("img[alt]")
+    if img and "쿠팡" in (img.get("alt") or ""):
+        return True
+    aria = el.get("aria-label") or ""
+    if "쿠팡" in aria:
+        return True
+    text_logo = el.select_one(".text__logo")
+    if text_logo and "쿠팡" in text_logo.get_text(strip=True):
+        return True
+    return False
+
+def _has_wow_hint(text): return "와우" in text or "WOW" in text.upper()
+
+def _has_card_hint(text):
+    for k in ["카드", "청구", "할인", "삼성", "롯데", "하나", "현대"]:
+        if k in text:
+            return True
+    return False
+
+def _pick_prices_in(el):
+    prices = []
+    for sel in [".text__num", ".price_num strong", ".txt_prc strong", ".prc strong"]:
+        for numel in el.select(sel):
+            num = _only_digits(numel.get_text(strip=True))
+            if num:
+                prices.append(int(num))
+    return prices
+
+def parse_product_html(html: str, pcode: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
     row = {"상품코드": pcode, "상품명": "이름없음", "쿠팡": "X", "쿠팡와우": "X", "쿠팡카드혜택가": "X"}
-    try:
-        driver.get(url)
-        WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.readyState") == "complete")
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#lowPriceCompanyArea")))
-        for _ in range(6):
-            driver.execute_script("window.scrollBy(0, 500);")
-            time.sleep(0.8)
 
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        title_tag = soup.select_one("meta[property='og:title']")
-        if title_tag and title_tag.get("content"):
-            row["상품명"] = title_tag["content"].strip()
+    tag = soup.select_one("meta[property='og:title']")
+    if tag and tag.get("content"):
+        row["상품명"] = tag["content"].strip()
+    else:
+        alt = soup.select_one(".prod_tit, h3.tit")
+        if alt:
+            row["상품명"] = alt.get_text(strip=True)
+
+    for li in soup.select("ul.list__mall-price > li.list-item"):
+        logo = li.select_one(".box__logo, .box__logo-wrap .box__logo")
+        if not _is_coupang_logo(logo):
+            continue
+        txt = li.get_text(" ", strip=True)
+        prices = _pick_prices_in(li)
+        if not prices:
+            continue
+        price = min(prices)
+        if _has_wow_hint(txt):
+            row["쿠팡와우"] = str(price)
+        elif _has_card_hint(txt):
+            row["쿠팡카드혜택가"] = str(price)
         else:
-            alt = soup.select_one(".prod_tit, h3.tit")
-            if alt:
-                row["상품명"] = alt.get_text(strip=True)
+            row["쿠팡"] = str(price)
+    return row
 
-        for li in soup.select("ul.list__mall-price > li.list-item"):
-            txt = li.get_text(" ", strip=True)
-            prices = [int(_only_digits(p.get_text(strip=True))) for p in li.select(".text__num, .price_num strong, .txt_prc strong, .prc strong") if _only_digits(p.get_text(strip=True))]
-            if not prices:
-                continue
-            price = min(prices)
-            logo = li.select_one(".box__logo, .box__logo-wrap .box__logo")
-            if not logo:
-                continue
-            is_coupang = "쿠팡" in (logo.get("aria-label") or "")
-            img = logo.select_one("img[alt]")
-            if img and "쿠팡" in img.get("alt", ""):
-                is_coupang = True
-            if not is_coupang:
-                continue
+# -----------------------------
+# 🔹 비동기 요청 (aiohttp)
+# -----------------------------
+async def fetch_one(session, pcode):
+    url = f"https://prod.danawa.com/info/?pcode={pcode}"
+    try:
+        async with session.get(url, timeout=10) as r:
+            html = await r.text()
+            return parse_product_html(html, pcode)
+    except Exception:
+        return {"상품코드": pcode, "상품명": "에러", "쿠팡": "X", "쿠팡와우": "X", "쿠팡카드혜택가": "X"}
 
-            if "와우" in txt or "WOW" in txt.upper():
-                row["쿠팡와우"] = str(price)
-            elif any(k in txt for k in ["카드", "청구", "할인", "삼성", "롯데", "하나", "현대"]):
-                row["쿠팡카드혜택가"] = str(price)
-            else:
-                row["쿠팡"] = str(price)
-        return row
+async def run_async_crawler(codes):
+    results_map = {}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        tasks = [fetch_one(session, c) for c in codes]
+        for coro in asyncio.as_completed(tasks):
+            row = await coro
+            results_map[row["상품코드"]] = row
+    return results_map
 
-    except Exception as e:
-        print(f"[오류] {pcode}: {e}")
-        return row
-
+# -----------------------------
+# 🔹 실행 함수
+# -----------------------------
 def run_requests_crawler():
     try:
-        print(f"[{datetime.now()}] Danawa 정확버전 시작")
+        print(f"[{datetime.now()}] Danawa 크롤링 시작")
         df = pd.read_excel(INPUT_PATH)
         codes = df["상품코드"].dropna().astype(str).tolist()
-        driver = get_driver()
 
-        results = []
-        for idx, code in enumerate(codes, start=1):
-            print(f"({idx}/{len(codes)}) {code} 크롤링 중...")
-            row = parse_with_selenium(driver, code)
-            results.append(row)
+        # 1️⃣ 비동기 크롤링 (HTML 기반)
+        results_map = asyncio.run(run_async_crawler(codes))
 
-        driver.quit()
+        # 2️⃣ 와우 가격 빠진 항목 Selenium으로 보정
+        need_wow = [c for c, r in results_map.items() if r.get("쿠팡와우") in ("X", "", None)]
+        print(f"🟡 와우가격 보정 대상 {len(need_wow)}개")
+        if need_wow:
+            driver = get_driver()
+            wow_map = fetch_wow_prices_selenium(driver, need_wow)
+            driver.quit()
+            for c, w in wow_map.items():
+                results_map[c]["쿠팡와우"] = w
+
+        # 3️⃣ 엑셀 정리 및 저장
+        results = [results_map[c] for c in codes if c in results_map]
         df_out = pd.DataFrame(results).fillna("X")
         nums = pd.DataFrame({
             "쿠팡": pd.to_numeric(df_out["쿠팡"], errors="coerce"),
@@ -117,6 +185,7 @@ def run_requests_crawler():
         df_out["최저가"] = nums.min(axis=1).map(lambda x: "X" if pd.isna(x) else str(int(x)))
         df_out.to_excel(OUTPUT_PATH, index=False)
 
+        # 4️⃣ 하이라이트 표시
         wb = load_workbook(OUTPUT_PATH)
         ws = wb.active
         yellow = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
@@ -127,8 +196,8 @@ def run_requests_crawler():
                     for cell in r:
                         cell.fill = yellow
         wb.save(OUTPUT_PATH)
-
         print(f"✅ 결과 파일 생성: {OUTPUT_PATH}")
+
     except Exception as e:
         print(traceback.format_exc())
         print(f"❌ 오류 발생: {e}")
