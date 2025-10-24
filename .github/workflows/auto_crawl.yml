@@ -21,7 +21,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get -y install unzip
-        pip install aiohttp selenium beautifulsoup4 openpyxl pandas webdriver-manager
+        pip install aiohttp selenium beautifulsoup4 openpyxl pandas webdriver-manager chardet lxml
 
     - name: Install Chrome
       run: |
