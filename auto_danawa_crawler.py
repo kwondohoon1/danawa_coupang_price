@@ -7,7 +7,7 @@ Original file is located at
     https://colab.research.google.com/drive/1-Mq30bavMMGFxHgWOOCEJpdgMXmn4L3i
 """
 
-import os, re, io, tempfile, traceback, asyncio, aiohttp, time
+import os, re, io, tempfile, traceback, asyncio, aiohttp, time, chardet
 from pathlib import Path
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -21,15 +21,23 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from datetime import datetime
 
+# -------------------------------------
+# 기본 설정
+# -------------------------------------
 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 TARGET_COLS = ["쿠팡", "쿠팡와우", "쿠팡카드혜택가"]
 
 WORKDIR = Path(os.getenv("GITHUB_WORKSPACE", os.getcwd()))
-INPUT_PATH = WORKDIR / "상품코드목록.xlsx"
+INPUT_PATH_XLSX = WORKDIR / "상품코드목록.xlsx"
+INPUT_PATH_CSV = WORKDIR / "상품코드목록.csv"
 OUTPUT_PATH = WORKDIR / f"danawa_쿠팡_결과_{datetime.now():%Y%m%d_%H%M}.xlsx"
 
-def _only_digits(s): return re.sub(r"[^\d]", "", s or "")
+def _only_digits(s): 
+    return re.sub(r"[^\d]", "", s or "")
 
+# -------------------------------------
+# Chrome driver 설정
+# -------------------------------------
 def get_driver():
     from webdriver_manager.chrome import ChromeDriverManager
     options = Options()
@@ -42,8 +50,10 @@ def get_driver():
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=options)
 
+# -------------------------------------
+# 와우가격 Selenium 보정
+# -------------------------------------
 def fetch_wow_prices_selenium(driver, pcodes):
-    """단일 Selenium 인스턴스로 와우가격 보정"""
     wow_map = {}
     for pcode in pcodes:
         try:
@@ -52,12 +62,9 @@ def fetch_wow_prices_selenium(driver, pcodes):
             WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "#lowPriceCompanyArea"))
             )
-
-            # 페이지 완전 로딩 및 스크롤
             for _ in range(6):
                 driver.execute_script("window.scrollBy(0, 500);")
                 time.sleep(0.8)
-
             html = driver.page_source
             soup = BeautifulSoup(html, "html.parser")
             full_text = soup.get_text(" ", strip=True)
@@ -68,9 +75,9 @@ def fetch_wow_prices_selenium(driver, pcodes):
             continue
     return wow_map
 
-# -----------------------------
-# 🔹 HTML 파싱
-# -----------------------------
+# -------------------------------------
+# HTML 파싱
+# -------------------------------------
 def _is_coupang_logo(el):
     if el is None:
         return False
@@ -85,7 +92,8 @@ def _is_coupang_logo(el):
         return True
     return False
 
-def _has_wow_hint(text): return "와우" in text or "WOW" in text.upper()
+def _has_wow_hint(text): 
+    return "와우" in text or "WOW" in text.upper()
 
 def _has_card_hint(text):
     for k in ["카드", "청구", "할인", "삼성", "롯데", "하나", "현대"]:
@@ -131,9 +139,32 @@ def parse_product_html(html: str, pcode: str) -> dict:
             row["쿠팡"] = str(price)
     return row
 
-# -----------------------------
-# 🔹 비동기 요청 (aiohttp)
-# -----------------------------
+# -------------------------------------
+# 파일 인코딩 자동 감지 (UTF-8 / CP949)
+# -------------------------------------
+def read_file_safely():
+    try:
+        # 1️⃣ XLSX 우선
+        if INPUT_PATH_XLSX.exists():
+            return pd.read_excel(INPUT_PATH_XLSX, engine="openpyxl")
+        # 2️⃣ CSV fallback
+        elif INPUT_PATH_CSV.exists():
+            with open(INPUT_PATH_CSV, "rb") as f:
+                raw = f.read(4096)
+                detected = chardet.detect(raw)
+                enc = detected.get("encoding", "utf-8")
+            try:
+                return pd.read_csv(INPUT_PATH_CSV, encoding=enc)
+            except UnicodeDecodeError:
+                return pd.read_csv(INPUT_PATH_CSV, encoding="cp949")
+        else:
+            raise FileNotFoundError("입력 파일을 찾을 수 없습니다. 상품코드목록.xlsx 또는 .csv 필요.")
+    except Exception as e:
+        raise RuntimeError(f"입력 파일 로드 오류: {e}")
+
+# -------------------------------------
+# 비동기 요청 (aiohttp)
+# -------------------------------------
 async def fetch_one(session, pcode):
     url = f"https://prod.danawa.com/info/?pcode={pcode}"
     try:
@@ -152,14 +183,17 @@ async def run_async_crawler(codes):
             results_map[row["상품코드"]] = row
     return results_map
 
-# -----------------------------
-# 🔹 실행 함수
-# -----------------------------
+# -------------------------------------
+# 실행 함수
+# -------------------------------------
 def run_requests_crawler():
     try:
         print(f"[{datetime.now()}] Danawa 크롤링 시작")
-        df = pd.read_excel(INPUT_PATH)
-        codes = df["상품코드"].dropna().astype(str).tolist()
+
+        df = read_file_safely()
+        if "상품코드" not in df.columns:
+            raise ValueError("입력 파일에 '상품코드' 열이 없습니다.")
+        codes = df["상품코드"].dropna().astype(str).str.replace(r"\.0$", "", regex=True).tolist()
 
         # 1️⃣ 비동기 크롤링 (HTML 기반)
         results_map = asyncio.run(run_async_crawler(codes))
@@ -183,7 +217,7 @@ def run_requests_crawler():
             "쿠팡카드혜택가": pd.to_numeric(df_out["쿠팡카드혜택가"], errors="coerce"),
         })
         df_out["최저가"] = nums.min(axis=1).map(lambda x: "X" if pd.isna(x) else str(int(x)))
-        df_out.to_excel(OUTPUT_PATH, index=False)
+        df_out.to_excel(OUTPUT_PATH, index=False, engine="openpyxl")
 
         # 4️⃣ 하이라이트 표시
         wb = load_workbook(OUTPUT_PATH)
@@ -196,11 +230,14 @@ def run_requests_crawler():
                     for cell in r:
                         cell.fill = yellow
         wb.save(OUTPUT_PATH)
-        print(f"✅ 결과 파일 생성: {OUTPUT_PATH}")
+        print(f"✅ 결과 파일 생성 완료: {OUTPUT_PATH}")
 
     except Exception as e:
         print(traceback.format_exc())
         print(f"❌ 오류 발생: {e}")
 
+# -------------------------------------
+# 메인 실행
+# -------------------------------------
 if __name__ == "__main__":
     run_requests_crawler()
