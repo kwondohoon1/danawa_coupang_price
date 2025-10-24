@@ -7,19 +7,25 @@ Original file is located at
     https://colab.research.google.com/drive/1-Mq30bavMMGFxHgWOOCEJpdgMXmn4L3i
 """
 
-import os, re, io, tempfile, traceback, asyncio, aiohttp, time, chardet
+import os, re, io, tempfile, traceback, asyncio, aiohttp, time, codecs
 from pathlib import Path
 import pandas as pd
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from datetime import datetime
+
+# chardet 있을 때만 사용 (없어도 폴백으로 동작)
+try:
+    import chardet  # type: ignore
+except Exception:
+    chardet = None
 
 # -------------------------------------
 # 기본 설정
@@ -29,11 +35,37 @@ TARGET_COLS = ["쿠팡", "쿠팡와우", "쿠팡카드혜택가"]
 
 WORKDIR = Path(os.getenv("GITHUB_WORKSPACE", os.getcwd()))
 INPUT_PATH_XLSX = WORKDIR / "상품코드목록.xlsx"
-INPUT_PATH_CSV = WORKDIR / "상품코드목록.csv"
-OUTPUT_PATH = WORKDIR / f"danawa_쿠팡_결과_{datetime.now():%Y%m%d_%H%M}.xlsx"
+INPUT_PATH_CSV  = WORKDIR / "상품코드목록.csv"
+OUTPUT_PATH     = WORKDIR / f"danawa_쿠팡_결과_{datetime.now():%Y%m%d_%H%M}.xlsx"
 
-def _only_digits(s): 
+def _only_digits(s):
     return re.sub(r"[^\d]", "", s or "")
+
+# -------------------------------------
+# CSV 인코딩 감지/폴백
+# -------------------------------------
+def detect_csv_encoding(path: Path) -> str:
+    # BOM 우선 체크
+    with open(path, "rb") as f:
+        head = f.read(4096)
+    if head.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig"
+
+    if chardet:
+        try:
+            enc = chardet.detect(head).get("encoding") or "utf-8"
+            return enc
+        except Exception:
+            pass
+
+    # 폴백: 시도 순서
+    for enc in ("utf-8", "utf-8-sig", "cp949", "euc-kr"):
+        try:
+            head.decode(enc)
+            return enc
+        except Exception:
+            continue
+    return "cp949"
 
 # -------------------------------------
 # Chrome driver 설정
@@ -92,7 +124,7 @@ def _is_coupang_logo(el):
         return True
     return False
 
-def _has_wow_hint(text): 
+def _has_wow_hint(text):
     return "와우" in text or "WOW" in text.upper()
 
 def _has_card_hint(text):
@@ -140,25 +172,26 @@ def parse_product_html(html: str, pcode: str) -> dict:
     return row
 
 # -------------------------------------
-# 파일 인코딩 자동 감지 (UTF-8 / CP949)
+# 파일 로드 (XLSX/CSV 자동)
 # -------------------------------------
 def read_file_safely():
     try:
-        # 1️⃣ XLSX 우선
         if INPUT_PATH_XLSX.exists():
             return pd.read_excel(INPUT_PATH_XLSX, engine="openpyxl")
-        # 2️⃣ CSV fallback
         elif INPUT_PATH_CSV.exists():
-            with open(INPUT_PATH_CSV, "rb") as f:
-                raw = f.read(4096)
-                detected = chardet.detect(raw)
-                enc = detected.get("encoding", "utf-8")
+            enc = detect_csv_encoding(INPUT_PATH_CSV)
             try:
                 return pd.read_csv(INPUT_PATH_CSV, encoding=enc)
             except UnicodeDecodeError:
-                return pd.read_csv(INPUT_PATH_CSV, encoding="cp949")
+                # 최종 폴백
+                for e in ("utf-8", "utf-8-sig", "cp949", "euc-kr"):
+                    try:
+                        return pd.read_csv(INPUT_PATH_CSV, encoding=e)
+                    except Exception:
+                        continue
+                raise
         else:
-            raise FileNotFoundError("입력 파일을 찾을 수 없습니다. 상품코드목록.xlsx 또는 .csv 필요.")
+            raise FileNotFoundError("입력 파일을 찾을 수 없습니다. 상품코드목록.xlsx 또는 상품코드목록.csv가 필요합니다.")
     except Exception as e:
         raise RuntimeError(f"입력 파일 로드 오류: {e}")
 
@@ -193,7 +226,7 @@ def run_requests_crawler():
         df = read_file_safely()
         if "상품코드" not in df.columns:
             raise ValueError("입력 파일에 '상품코드' 열이 없습니다.")
-        codes = df["상품코드"].dropna().astype(str).str.replace(r"\.0$", "", regex=True).tolist()
+        codes = df["상품코드"].dropna().astype(str).str.replace(r"\.0$", "", regex=True).str.strip().tolist()
 
         # 1️⃣ 비동기 크롤링 (HTML 기반)
         results_map = asyncio.run(run_async_crawler(codes))
