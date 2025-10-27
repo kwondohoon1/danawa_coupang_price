@@ -21,10 +21,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from datetime import datetime
 
-# ==========================================
-# ⚡ Danawa 쿠팡 초고속 자동 크롤러 (GitHub Actions 버전)
-# ==========================================
-
 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 TARGET_COLS = ["쿠팡", "쿠팡와우", "쿠팡카드혜택가"]
 
@@ -33,16 +29,9 @@ INPUT_PATH = WORKDIR / "상품코드목록.xlsx"
 OUTPUT_PATH = WORKDIR / f"danawa_쿠팡_결과_{datetime.now():%Y%m%d_%H%M}.xlsx"
 
 
-# -----------------------------
-# 🔹 기본 유틸
-# -----------------------------
 def _only_digits(s): 
     return re.sub(r"[^\d]", "", s or "")
 
-
-# -----------------------------
-# 🔹 Selenium 드라이버
-# -----------------------------
 def get_driver():
     from webdriver_manager.chrome import ChromeDriverManager
     options = Options()
